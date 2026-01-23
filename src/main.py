@@ -10,6 +10,7 @@ import base64
 import speech_recognition as sr
 from gpiozero import Robot, DistanceSensor
 from llama_cpp import Llama
+from ultralytics import YOLO  
 
 # ==========================================
 # ⚙️  CONFIGURATION
@@ -27,6 +28,7 @@ LAPTOP_URL = f"http://{LAPTOP_IP}:{LAPTOP_PORT}/api/chat"
 
 # 3. LOCAL BRAIN
 MODEL_PATH = "/home/pi/qwen.gguf"
+YOLO_MODEL_PATH = "yolov8n.pt" # <--- NEW: Using Nano model for speed
 
 # 4. ROBOT SETTINGS
 WAKE_WORD = "hey blue"
@@ -38,6 +40,7 @@ face = None
 robot_hw = None
 sensor = None
 llm = None
+yolo_model = None  # <--- NEW OBJECT
 obstacle_detected = False
 
 # ==========================================
@@ -100,6 +103,7 @@ def speak(text):
     if face: face.set_expression("NEUTRAL")
 
 def capture_image(filename="view.jpg"):
+    # Using libcamera (rpicam)
     subprocess.run(f"rpicam-still -o {filename} -t 100 --width 640 --height 480 -n", shell=True)
     return filename
 
@@ -109,7 +113,7 @@ def llm_query(prompt, system_prompt="You are a helpful robot assistant."):
         output = llm.create_chat_completion(
             messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": prompt}],
             temperature=0.3,
-            max_tokens=150  # Increased slightly to allow for chat answers
+            max_tokens=150  
         )
         return output['choices'][0]['message']['content']
     except Exception as e:
@@ -152,6 +156,58 @@ def do_see():
     img_path = capture_image("current_view.jpg")
     desc = get_vision_description(img_path, "Describe what is directly in front of you briefly.")
     speak(f"I see {desc}")
+
+# --- NEW YOLOv8 FIND FUNCTION ---
+def do_find(target_object):
+    speak(f"Looking for {target_object}")
+    
+    # 1. Capture Image
+    img_path = capture_image("find_view.jpg")
+    
+    # 2. Run YOLO Inference
+    if yolo_model:
+        results = yolo_model(img_path, verbose=False)
+        
+        found = False
+        location = "CENTER"
+        
+        # 3. Analyze Results
+        for r in results:
+            for box in r.boxes:
+                # Get class name (e.g., 'cup', 'person')
+                class_id = int(box.cls[0])
+                class_name = yolo_model.names[class_id]
+                confidence = float(box.conf[0])
+
+                # Check if this is what we want (simple string matching)
+                if target_object in class_name.lower() and confidence > 0.5:
+                    found = True
+                    
+                    # Calculate Position (Left/Right/Center)
+                    x1, y1, x2, y2 = box.xyxy[0]
+                    center_x = (x1 + x2) / 2
+                    image_width = 640
+                    
+                    if center_x < (image_width / 3):
+                        location = "LEFT"
+                    elif center_x > (image_width * 2 / 3):
+                        location = "RIGHT"
+                    else:
+                        location = "CENTER"
+                    
+                    break # Stop at the first match
+            if found: break
+        
+        # 4. Act
+        if found:
+            speak(f"I found the {target_object} on your {location}.")
+            if location == "LEFT": do_move("left", 0.3)
+            elif location == "RIGHT": do_move("right", 0.3)
+            elif location == "CENTER": do_move("forward", 0.5)
+        else:
+            speak(f"I do not see any {target_object}.")
+    else:
+        speak("My vision system is not loaded.")
 
 def do_explore():
     speak("Starting area scan.")
@@ -196,7 +252,6 @@ def main_robot_loop():
                 text = rec.recognize_google(audio).lower()
                 print(text)                
                 
-                
                 if WAKE_WORD in text:
                     if face: face.set_expression("LISTENING")
                     speak("Yes?")
@@ -226,6 +281,16 @@ def main_robot_loop():
                                 do_explore()
                             elif "what do you see" in cmd or "look at this" in cmd:
                                 do_see()
+                            
+                            # --- NEW FIND COMMAND ---
+                            elif "find" in cmd or "where is" in cmd:
+                                # Extract object name (e.g. "find the cup" -> "cup")
+                                target = cmd.replace("find", "").replace("the", "").replace("where is", "").strip()
+                                if target:
+                                    do_find(target)
+                                else:
+                                    speak("Find what?")
+
                             elif "move" in cmd or "go" in cmd or "turn" in cmd:
                                 found_dir = False
                                 if "left" in cmd: do_move("left"); found_dir=True
@@ -251,16 +316,19 @@ def main_robot_loop():
                             else:
                                 print("🤔 Asking Qwen to Classify OR Answer...")
                                 
-                                # OPTIMIZED PROMPT: Ask for classification OR the answer directly
+                                # Updated Prompt to include FIND intent
                                 classify_prompt = f"""
                                 User said: "{cmd}"
                                 
                                 Instructions:
-                                1. If this is a COMMAND to Move/Explore/See, return JSON:
-                                   {{"intent": "MOVE", "arg": "left/right"}} OR {{"intent": "EXPLORE"}} OR {{"intent": "SEE"}}
+                                1. If this is a COMMAND, return JSON:
+                                   {{"intent": "MOVE", "arg": "left/right"}} 
+                                   OR {{"intent": "EXPLORE"}} 
+                                   OR {{"intent": "SEE"}}
+                                   OR {{"intent": "FIND", "arg": "object_name"}}
                                 
-                                2. If this is a QUESTION or CHAT, answer it immediately in the JSON:
-                                   {{"intent": "CHAT", "response": "Your short, witty answer here."}}
+                                2. If this is a CHAT, return JSON:
+                                   {{"intent": "CHAT", "response": "Short answer."}}
                                 
                                 OUTPUT JSON ONLY.
                                 """
@@ -268,7 +336,6 @@ def main_robot_loop():
                                 raw_response = llm_query(classify_prompt, "You are a JSON command parser.")
                                 
                                 try:
-                                    # Extract JSON
                                     start_idx = raw_response.find('{')
                                     end_idx = raw_response.rfind('}') + 1
                                     json_str = raw_response[start_idx:end_idx]
@@ -278,10 +345,8 @@ def main_robot_loop():
                                     
                                     print(f"🤖 Decided: {intent}")
                                     
-                                    # EXECUTE
                                     if intent == "CHAT":
-                                        # 🚀 SPEED BOOST: We already have the answer!
-                                        reply = data.get("response", "I am not sure what you mean.")
+                                        reply = data.get("response", "I am not sure.")
                                         speak(reply)
                                         
                                     elif intent == "MOVE":
@@ -290,17 +355,19 @@ def main_robot_loop():
                                         elif "right" in arg: do_move("right")
                                         elif "forward" in arg: do_move("forward")
                                         elif "back" in arg: do_move("back")
-                                        else: speak("Move where?")
                                         
                                     elif intent == "EXPLORE":
                                         do_explore()
                                         
                                     elif intent == "SEE":
                                         do_see()
+                                        
+                                    elif intent == "FIND":
+                                        target = data.get("arg", "object")
+                                        do_find(target)
 
                                 except Exception as e:
                                     print(f"⚠️ JSON Parse Failed: {e}")
-                                    # Fallback: Just answer it blindly
                                     fallback = llm_query(cmd, "Answer briefly.")
                                     speak(fallback)
                             
@@ -332,8 +399,17 @@ if __name__ == "__main__":
     try: robot_hw = Robot(left=LEFT_PINS, right=RIGHT_PINS); sensor = DistanceSensor(echo=ECHO_PIN, trigger=TRIGGER_PIN)
     except: print("⚠️ HW Error")
     
+    print("⏳ Initializing LLM...")
     try: llm = Llama(model_path=MODEL_PATH, n_ctx=2048, verbose=False)
     except: print("❌ LLM Error")
+
+    # --- NEW: Initialize YOLO ---
+    print("⏳ Initializing YOLOv8...")
+    try:
+        yolo_model = YOLO(YOLO_MODEL_PATH) 
+        # This will auto-download 'yolov8n.pt' the first time
+    except Exception as e: 
+        print(f"❌ YOLO Error: {e}")
 
     threading.Thread(target=safety_monitor, daemon=True).start()
     threading.Thread(target=main_robot_loop, daemon=True).start()
